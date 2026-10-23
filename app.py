@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
     )
 
 # Reuse the existing pipeline — do NOT reimplement crypto / parsing here.
-from core import (constants, db_decryptor, db_reader, key_extractor,  # noqa: E402
+from core import (account_state, constants, db_decryptor, db_reader, key_extractor,  # noqa: E402
                   locator, message_parser)
 from core.media import MediaResolver, silk_to_wav  # noqa: E402
 from core.models import Contact, ExportBundle, Layout, Message  # noqa: E402
@@ -59,7 +59,7 @@ _EXPORT_FILES: Dict[str, str] = {}
 _EXPORT_LOCK = threading.RLock()
 
 # Default output directory (sudo-safe expansion via constants.HOME).
-DEFAULT_OUT_DIR = os.path.join(constants.HOME, "Desktop")
+DEFAULT_OUT_DIR = os.path.join(constants.APP_DIR, "exports")
 
 app = Flask(__name__)
 
@@ -124,8 +124,7 @@ def _get_session(account_id: str) -> Session:
             except Exception:
                 pass
         layout = locator.select_account(account_id or None)
-        keys = key_extractor.get_keys(method="auto", manual=None,
-                                      use_cache=True, save=True)
+        keys = account_state.load_keys(layout)
         decrypted = db_decryptor.decrypt_layout(layout, keys)
         sess = Session(layout, keys, decrypted)
         _SESSIONS[layout.account_id] = sess
@@ -178,6 +177,7 @@ def _err(msg: str, code: int = 400):
 def _account_info(layout: Layout) -> Dict:
     return {
         "account_id": layout.account_id,
+        "configured": account_state.ready(layout),
         "version": layout.version,
         "message_dbs": len(layout.message_dbs),
     }
@@ -334,6 +334,8 @@ def api_accounts():
     """Detected account(s): version + message-db count."""
     try:
         accounts = locator.discover_accounts()
+    except PermissionError:
+        return _err("macOS 未允许读取微信目录。请在系统设置 → 隐私与安全 → 完全磁盘访问权限中允许终端，再从「启动.command」重新打开。", 403)
     except Exception as e:  # pragma: no cover
         return _err("扫描账号失败: %s" % e, 500)
     if not accounts:
@@ -835,6 +837,7 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div class="panel col-left">
     <h3>1 · 账号</h3>
+    <div class="muted">先双击「配置账号.command」配置本人授权的账号，再在下方点选。每个账号分别保存配置。</div>
     <div id="accounts" class="muted">正在检测账号…</div>
 
     <h3 style="margin-top:14px">2 · 联系人</h3>
@@ -908,27 +911,37 @@ async function loadAccounts(){
     j.accounts.forEach((a,i)=>{
       const div=document.createElement("div"); div.className="acct";
       div.innerHTML = '<span class="pill">'+esc(a.version)+'</span><b>'+esc(a.account_id)+'</b>'+
-                      ' · 消息库 '+a.message_dbs+' 个';
+                      ' · 消息库 '+a.message_dbs+' 个 · '+(a.configured?'已配置':'待配置');
       div.style.cursor="pointer";
       div.onclick=()=>selectAccount(a.account_id, box, div);
       box.appendChild(div);
-      if(i===0) selectAccount(a.account_id, box, div);
+      // Each account is selected explicitly by its owner.
     });
   }catch(e){ $("accounts").innerHTML='<span class="err">'+esc(e.message)+'</span>'; }
 }
 
 function selectAccount(id, box, el){
   ACCOUNT=id;
+  CONTACT=null;
+  MESSAGES=[]; EXCLUDED.clear();
+  $("contactHint").textContent="";
+  $("q").value="";
+  $("loadBtn").disabled=true;
+  $("exportBtn").disabled=true;
+  $("files").innerHTML="";
+  $("preview").innerHTML="";
   [...box.children].forEach(c=>c.style.outline="");
   if(el) el.style.outline="2px solid #07c160";
   loadContacts("");
 }
 
 async function loadContacts(q){
+  const requestAccount=ACCOUNT;
   const box=$("contacts");
   box.innerHTML='<div class="muted" style="padding:10px">加载中（首次会解密数据库，请稍候）…</div>';
   try{
     const j = await getJSON("/api/contacts?account_id="+encodeURIComponent(ACCOUNT)+"&q="+encodeURIComponent(q||""));
+    if(requestAccount!==ACCOUNT) return;
     box.innerHTML="";
     if(!j.contacts.length){ box.innerHTML='<div class="muted" style="padding:10px">没有匹配的联系人。</div>'; }
     j.contacts.forEach(c=>{
@@ -946,7 +959,7 @@ async function loadContacts(q){
       box.appendChild(div);
     });
     $("contactHint").textContent = j.truncated ? ("仅显示前 "+j.contacts.length+" / "+j.total+" 条，输入更精确的关键词缩小范围。") : "";
-  }catch(e){ box.innerHTML='<div class="err" style="padding:10px">'+esc(e.message)+'</div>'; }
+  }catch(e){ if(requestAccount!==ACCOUNT) return; box.innerHTML='<div class="err" style="padding:10px">'+esc(e.message)+'</div>'; }
 }
 
 function fmtsSelected(){ return [...document.querySelectorAll(".fmt:checked")].map(c=>c.value); }
@@ -988,6 +1001,7 @@ $("q").addEventListener("keydown", e=>{ if(e.key==="Enter"){ if(ACCOUNT) loadCon
 
 $("loadBtn").onclick = async ()=>{
   if(!CONTACT) return;
+  const requestAccount=ACCOUNT, requestContact=CONTACT;
   EXCLUDED.clear();
   setStatus("正在加载消息…（图片/语音也在解析，可能稍慢）");
   $("loadBtn").disabled=true; $("exportBtn").disabled=true; $("files").innerHTML="";
@@ -996,15 +1010,17 @@ $("loadBtn").onclick = async ()=>{
             "&voice="+($("voice").checked?"1":"0");
   try{
     const j=await getJSON(url);
+    if(requestAccount!==ACCOUNT || requestContact!==CONTACT) return;
     MESSAGES=j.messages; renderPreview();
     setStatus("已加载 "+j.count+" 条消息。可勾选格式后点「导出」。");
     $("exportBtn").disabled=false;
-  }catch(e){ setStatus(e.message, true); }
+  }catch(e){ if(requestAccount!==ACCOUNT || requestContact!==CONTACT) return; setStatus(e.message, true); }
   $("loadBtn").disabled=false;
 };
 
 $("exportBtn").onclick = async ()=>{
   if(!CONTACT) return;
+  const requestAccount=ACCOUNT, requestContact=CONTACT;
   const formats=fmtsSelected();
   if(!formats.length){ setStatus("请至少勾选一种格式。", true); return; }
   setStatus("正在导出"+($("voice").checked?"（含语音转写，较慢）":"")+"…");
@@ -1014,12 +1030,13 @@ $("exportBtn").onclick = async ()=>{
       account_id:ACCOUNT, username:CONTACT, start:$("start").value, end:$("end").value,
       formats:formats, excluded:[...EXCLUDED], voice:$("voice").checked, density:$("density").value
     });
+    if(requestAccount!==ACCOUNT || requestContact!==CONTACT) return;
     const f=$("files"); f.innerHTML="";
     const head=document.createElement("div"); head.textContent="已导出 "+j.count+" 条到: "+j.out_dir; f.appendChild(head);
     j.files.forEach(file=>{ const a=document.createElement("a"); a.href=file.url; a.textContent="⬇ "+file.name; a.setAttribute("download",""); f.appendChild(a); });
     if(j.errors&&j.errors.length){ const e=document.createElement("div"); e.className="err"; e.textContent=j.errors.join("\n"); f.appendChild(e); }
     setStatus("导出完成。");
-  }catch(e){ setStatus(e.message, true); }
+  }catch(e){ if(requestAccount!==ACCOUNT || requestContact!==CONTACT) return; setStatus(e.message, true); }
   $("exportBtn").disabled=false;
 };
 
@@ -1049,7 +1066,8 @@ def _pick_port(preferred: int = 8765) -> int:
 
 
 def main() -> None:
-    port = _pick_port(8765)
+    os.umask(0o077)
+    port = _pick_port(49310)
     url = "http://127.0.0.1:%d" % port
     print("=" * 60)
     print(" 微信聊天记录导出 · 本地图形界面")
@@ -1065,12 +1083,12 @@ def main() -> None:
             webbrowser.open(url)
         except Exception:
             pass
-    threading.Thread(target=_open, daemon=True).start()
+    if not os.environ.get("WECHAT_EXPORTER_NO_BROWSER"):
+        threading.Thread(target=_open, daemon=True).start()
 
     # Threaded so media/preview requests don't block each other. Reloader off so
     # the browser-open thread and module globals behave deterministically.
-    app.run(host="127.0.0.1", port=port, threaded=True,
-            debug=False, use_reloader=False)
+    app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":

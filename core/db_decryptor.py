@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from typing import Callable, Dict, Iterable, Optional, Union
 from urllib.parse import quote
 
@@ -176,11 +177,33 @@ def decrypt_database(
     if os.path.exists(out_path):
         os.remove(out_path)
 
-    # Open the SOURCE strictly read-only + immutable so we can NEVER write to
-    # WeChat's own file or create -wal/-shm/-journal sidecars next to it. The
-    # plaintext output is a separate, writable file attached below.
-    src_uri = "file:" + quote(src_db) + "?mode=ro&immutable=1"
-    conn = dbapi2.connect(src_uri, uri=True)
+    # Read DB and WAL into a private snapshot. immutable=1 would silently
+    # ignore committed messages still in the WAL. Never open the original RW.
+    snapshot = tempfile.TemporaryDirectory(prefix="wechat-export-snapshot-")
+    copied_db = os.path.join(snapshot.name, "source.db")
+    def fingerprint(path):
+        try:
+            st = os.stat(path)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return None
+    paths = (src_db, src_db + "-wal")
+    try:
+        for attempt in range(3):
+            before = tuple(fingerprint(path) for path in paths)
+            shutil.copyfile(src_db, copied_db)
+            if before[1] is not None:
+                shutil.copyfile(src_db + "-wal", copied_db + "-wal")
+            elif os.path.exists(copied_db + "-wal"):
+                os.remove(copied_db + "-wal")
+            if before == tuple(fingerprint(path) for path in paths):
+                break
+        else:
+            raise DecryptError("微信正在持续写入记录，暂时无法取得稳定副本。请稍后重试。")
+        conn = dbapi2.connect(copied_db)
+    except BaseException:
+        snapshot.cleanup()
+        raise
     try:
         cur = conn.cursor()
         # Raw key literal must be quoted as a string inside the PRAGMA.
@@ -211,6 +234,7 @@ def decrypt_database(
             ) from exc
     finally:
         conn.close()
+        snapshot.cleanup()
 
     return out_path
 
@@ -300,13 +324,13 @@ def decrypt_layout(
         if progress is not None:
             progress(done, total, label)
 
-    # A single bad message shard is tolerated; total failure is not.
-    if message_total > 0 and message_ok == 0:
+    # Refuse silent partial exports: an absent key must remain visible.
+    if errors:
         detail = "\n".join(
             "  - %s: %s" % (os.path.basename(s), m) for s, m in errors.items()
         )
         raise DecryptError(
-            "所有消息数据库都解密失败，无法继续。\n" + detail
+            "部分数据库未能解密，已停止以避免漏导。请重新配置这个账号。\n" + detail
         )
 
     return result

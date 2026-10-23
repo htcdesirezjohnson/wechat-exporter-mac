@@ -64,7 +64,7 @@ V4_ROOT = os.path.join(CONTAINER, "Documents", "xwechat_files")
 # --------------------------------------------------------------------------- #
 # Application paths used by the tool itself (resolved against the real home).
 # --------------------------------------------------------------------------- #
-APP_DIR = os.path.join(HOME, ".wechat_exporter")
+APP_DIR = os.environ.get("WECHAT_EXPORTER_DATA_DIR", os.path.join(HOME, "Library", "Application Support", "WeChatExporterLocal"))
 KEY_CACHE = os.path.join(APP_DIR, "keys.json")          # map: salt/db -> key
 DECRYPTED_DIR = os.path.join(APP_DIR, "decrypted")      # plaintext DB copies
 VOICE_CACHE_DIR = os.path.join(APP_DIR, "voice_cache")  # transcription cache

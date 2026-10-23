@@ -13,8 +13,8 @@ venv/
 .build/
 
 # Any local exports or decrypted material that lands inside the repo by mistake.
-# (Real runtime data lives in ~/.wechat_exporter/ — keys, decrypted DBs, voice
-#  cache — which is OUTSIDE this repo. Never commit keys or decrypted data.)
+# Runtime data lives in ~/Library/Application Support/WeChatExporterLocal/
+# outside this repository. Never commit keys or decrypted data.
 *.decrypted.db
 微信导出_*
 keys.json
@@ -22,3 +22,15 @@ keys.json
 # 原始未打码截图（含真实 wxid），仅本地保留，勿提交
 1.png
 2.png
+
+# Local account data and exports must never enter GitHub
+.wechat-local/
+exports/
+*.log
+*.bak
+*.db
+*.db-wal
+*.db-shm
+keys.json
+*.app/
+*.disabled/
